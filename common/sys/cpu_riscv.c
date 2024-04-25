@@ -4,10 +4,12 @@
 #include <lib/acpi.h>
 #include <lib/misc.h>
 #include <lib/print.h>
+#include <lib/dtb.h>
 #include <sys/cpu.h>
 #include <mm/pmm.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <lib/smoldtb.h>
 
 // ACPI RISC-V Hart Capabilities Table
 struct rhct {
@@ -81,76 +83,165 @@ static inline struct rhct_hart_info *rhct_get_hart_info(struct rhct *rhct, uint3
     return NULL;
 }
 
+void dtb_error(const char *why) {
+    panic(false, "dtb: %s", why);
+}
+
 void init_riscv(void) {
     struct madt *madt = acpi_get_table("APIC", 0);
     struct rhct *rhct = acpi_get_table("RHCT", 0);
-    if (madt == NULL || rhct == NULL) {
-        panic(false, "riscv: requires acpi");
-    }
+    if (madt != NULL && rhct != NULL) {
+        for (uint8_t *madt_ptr = (uint8_t *)madt->madt_entries_begin;
+            (uintptr_t)madt_ptr < (uintptr_t)madt + madt->header.length; madt_ptr += *(madt_ptr + 1)) {
+            if (*madt_ptr != 0x18) {
+                continue;
+            }
+            struct madt_riscv_intc *intc = (struct madt_riscv_intc *)madt_ptr;
 
-    for (uint8_t *madt_ptr = (uint8_t *)madt->madt_entries_begin;
-         (uintptr_t)madt_ptr < (uintptr_t)madt + madt->header.length; madt_ptr += *(madt_ptr + 1)) {
-        if (*madt_ptr != 0x18) {
-            continue;
-        }
-        struct madt_riscv_intc *intc = (struct madt_riscv_intc *)madt_ptr;
+            // Ignore harts we can't do anything with.
+            if (!(intc->flags & MADT_RISCV_INTC_ENABLED ||
+                    intc->flags & MADT_RISCV_INTC_ONLINE_CAPABLE)) {
+                continue;
+            }
 
-        // Ignore harts we can't do anything with.
-        if (!(intc->flags & MADT_RISCV_INTC_ENABLED ||
-                intc->flags & MADT_RISCV_INTC_ONLINE_CAPABLE)) {
-            continue;
-        }
+            uint32_t acpi_uid = intc->acpi_processor_uid;
+            size_t hartid = intc->hartid;
 
-        uint32_t acpi_uid = intc->acpi_processor_uid;
-        size_t hartid = intc->hartid;
+            struct rhct_hart_info *hart_info = rhct_get_hart_info(rhct, acpi_uid);
+            if (hart_info == NULL) {
+                panic(false, "riscv: missing rhct node for hartid %u", hartid);
+            }
 
-        struct rhct_hart_info *hart_info = rhct_get_hart_info(rhct, acpi_uid);
-        if (hart_info == NULL) {
-            panic(false, "riscv: missing rhct node for hartid %u", hartid);
-        }
+            const char *isa_string = NULL;
+            uint8_t mmu_type = 0;
+            uint8_t flags = 0;
 
-        const char *isa_string = NULL;
-        uint8_t mmu_type = 0;
-        uint8_t flags = 0;
+            for (uint32_t i = 0; i < hart_info->offsets_len; i++) {
+                const struct rhct_header *node = (void *)((uintptr_t)rhct + hart_info->offsets[i]);
+                switch (node->type) {
+                    case RHCT_ISA_STRING:
+                        isa_string = ((struct rhct_isa_string *)node)->isa_string;
+                        break;
+                    case RHCT_MMU:
+                        mmu_type = ((struct rhct_mmu *)node)->mmu_type;
+                        flags |= RISCV_HART_HAS_MMU;
+                        break;
+                }
+            }
 
-        for (uint32_t i = 0; i < hart_info->offsets_len; i++) {
-            const struct rhct_header *node = (void *)((uintptr_t)rhct + hart_info->offsets[i]);
-            switch (node->type) {
-                case RHCT_ISA_STRING:
-                    isa_string = ((struct rhct_isa_string *)node)->isa_string;
-                    break;
-                case RHCT_MMU:
-                    mmu_type = ((struct rhct_mmu *)node)->mmu_type;
-                    flags |= RISCV_HART_HAS_MMU;
-                    break;
+            if (isa_string == NULL) {
+                print("riscv: missing isa string for hartid %u, skipping.\n", hartid);
+                continue;
+            }
+
+            if (strncmp("rv64", isa_string, 4) && strncmp("rv32", isa_string, 4)) {
+                print("riscv: skipping hartid %u with invalid isa string: %s", hartid, isa_string);
+            }
+
+            struct riscv_hart *hart = ext_mem_alloc(sizeof(struct riscv_hart));
+            if (hart == NULL) {
+                panic(false, "out of memory");
+            }
+
+            hart->hartid = hartid;
+            hart->acpi_uid = acpi_uid;
+            hart->isa_string = isa_string;
+            hart->mmu_type = mmu_type;
+            hart->flags = flags;
+
+            hart->next = hart_list;
+            hart_list = hart;
+
+            if (hart->hartid == bsp_hartid) {
+                bsp_hart = hart;
             }
         }
+    } else {
+        void *dtb = get_dtb();
+        if (dtb == NULL) {
+            panic(false, "riscv: no DTB and ACPI tables found");
+        }
+    
+        // TODO: Move this to lib/dtb.c
+        dtb_ops ops = {
+            .malloc = ext_mem_alloc,
+            .free = NULL,
+            .on_error = dtb_error,
+        };
+        dtb_init((uintptr_t)dtb, ops);
 
-        if (isa_string == NULL) {
-            print("riscv: missing isa string for hartid %u, skipping.\n", hartid);
-            continue;
+        dtb_node *cpus = dtb_find("cpus");
+        if (cpus == NULL) {
+            panic(false, "riscv: no cpus node found in DTB");
         }
 
-        if (strncmp("rv64", isa_string, 4) && strncmp("rv32", isa_string, 4)) {
-            print("riscv: skipping hartid %u with invalid isa string: %s", hartid, isa_string);
-        }
+        dtb_node *cpu = dtb_find_child(cpus, "cpu");
+        while (cpu != NULL) {
+            dtb_node_stat stat;
+            dtb_stat_node(cpu, &stat);
 
-        struct riscv_hart *hart = ext_mem_alloc(sizeof(struct riscv_hart));
-        if (hart == NULL) {
-            panic(false, "out of memory");
-        }
+            if (strncmp(stat.name, "cpu", 3)) {
+                cpu = dtb_get_sibling(cpu);
+                continue;
+            }
 
-        hart->hartid = hartid;
-        hart->acpi_uid = acpi_uid;
-        hart->isa_string = isa_string;
-        hart->mmu_type = mmu_type;
-        hart->flags = flags;
+            const char * isa_string = NULL;
+            dtb_prop *isa = dtb_find_prop(cpu, "riscv,isa");
+            if (isa != NULL) {
+                isa_string = dtb_read_string(isa, 0);
+            }
 
-        hart->next = hart_list;
-        hart_list = hart;
+            uint32_t hartid = 0;
+            dtb_prop *hartid_prop = dtb_find_prop(cpu, "reg");
+            if (hartid_prop != NULL) {
+                size_t val = 0;
+                if (dtb_read_prop_values(hartid_prop, 1, &val) != 1) {
+                    panic(false, "riscv: invalid reg property in cpu node");
+                }
+                hartid = val;
+            } else {
+                panic(false, "riscv: no reg property found in cpu node");
+            }
 
-        if (hart->hartid == bsp_hartid) {
-            bsp_hart = hart;
+            int mmu_type = 0;
+            dtb_prop *mmu = dtb_find_prop(cpu, "mmu-type");
+            if (mmu != NULL) {
+                int index = 0;
+                const char * mmu_string = dtb_read_string(mmu, index);
+                while (mmu_string != NULL) {
+                    if (!strcmp(mmu_string, "riscv,sv39") && mmu_type < 0) {
+                        mmu_type = 0;
+                    } else if (!strcmp(mmu_string, "riscv,sv48") && mmu_type < 1) {
+                        mmu_type = 1;
+                    } else if (!strcmp(mmu_string, "riscv,sv57") && mmu_type < 2) {
+                        mmu_type = 2;
+                    }
+
+                    index++;
+                    mmu_string = dtb_read_string(mmu, index);
+                }
+            }
+
+
+            struct riscv_hart *hart = ext_mem_alloc(sizeof(struct riscv_hart));
+            if (hart == NULL) {
+                panic(false, "out of memory");
+            }
+
+            hart->hartid = hartid;
+            hart->acpi_uid = 0;
+            hart->isa_string = isa_string;
+            hart->mmu_type = mmu_type;
+            hart->flags = mmu_type;
+
+            hart->next = hart_list;
+            hart_list = hart;
+
+            if (hart->hartid == bsp_hartid) {
+                bsp_hart = hart;
+            }
+
+            cpu = dtb_get_sibling(cpu);
         }
     }
 

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdnoreturn.h>
 #include <config.h>
+#include <lib/dtb.h>
 #include <lib/elf.h>
 #include <lib/misc.h>
 #include <lib/acpi.h>
@@ -614,14 +615,16 @@ FEAT_START
         break; // next feature
     }
 
+    void *rsdp = acpi_get_rsdp();
+    if (!rsdp) {
+        // No RSDP
+        break;
+    }
+
     struct limine_rsdp_response *rsdp_response =
         ext_mem_alloc(sizeof(struct limine_rsdp_response));
 
-    void *rsdp = acpi_get_rsdp();
-    if (rsdp) {
-        rsdp_response->address = reported_addr(rsdp);
-    }
-
+    rsdp_response->address = reported_addr(rsdp);
     rsdp_request->response = reported_addr(rsdp_response);
 FEAT_END
 
@@ -677,25 +680,17 @@ FEAT_START
     }
 
 #if defined (UEFI)
-    // TODO: Looking for the DTB should be moved out of here and into lib/, because:
-    // 1. We will need it for core bring-up for the SMP request.
-    // 2. We will need to patch it for the Linux boot protocol to set the initramfs
-    //    and boot arguments.
-    // 3. If Limine is ported to platforms that use a DTB but do not use UEFI, it will
-    //    need to be found in a different way.
-    const EFI_GUID dtb_guid = EFI_DTB_TABLE_GUID;
 
-    // Look for the DTB in the configuration tables
-    for (size_t i = 0; i < gST->NumberOfTableEntries; i++) {
-        EFI_CONFIGURATION_TABLE *cur_table = &gST->ConfigurationTable[i];
-
-        if (memcmp(&cur_table->VendorGuid, &dtb_guid, sizeof(EFI_GUID)) == 0) {
-            struct limine_dtb_response *dtb_response =
-                ext_mem_alloc(sizeof(struct limine_dtb_response));
-            dtb_response->dtb_ptr = reported_addr((void *)cur_table->VendorTable);
-            dtb_request->response = reported_addr(dtb_response);
+    void *dtb = get_dtb();
+    if (dtb != NULL) {
+        struct limine_dtb_response *dtb_response =
+            ext_mem_alloc(sizeof(struct limine_dtb_response));
+        if (dtb_response == NULL) {
+            panic(true, "limine: Failed to allocate memory for DTB response");
             break;
         }
+        dtb_response->dtb_ptr = reported_addr(dtb);
+        dtb_request->response = reported_addr(dtb_response);
     }
 
 #endif
